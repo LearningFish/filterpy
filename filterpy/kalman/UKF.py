@@ -142,7 +142,7 @@ class UnscentedKalmanFilter(object):
     x : numpy.array(dim_x)
         state estimate vector
 
-    P : numpy.array(dim_x, dim_x)
+    Px: numpy.array(dim_x, dim_x)
         covariance estimate matrix
 
     x_prior : numpy.array(dim_x)
@@ -162,10 +162,16 @@ class UnscentedKalmanFilter(object):
     z : ndarray
         Last measurement used in update(). Read only.
 
-    R : numpy.array(dim_z, dim_z)
+    un : numpy.array(dim_z)
+        measurement noise mean vector
+
+    Pn: numpy.array(dim_z, dim_z)
         measurement noise matrix
 
-    Q : numpy.array(dim_x, dim_x)
+    uv : numpy.array(dim_x)
+        process noise mean vector
+
+    Pv: numpy.array(dim_x, dim_x)
         process noise matrix
 
     K : numpy.array
@@ -289,11 +295,13 @@ class UnscentedKalmanFilter(object):
         #pylint: disable=too-many-arguments
 
         self.x = zeros(dim_x)
-        self.P = eye(dim_x)
+        self.Px = eye(dim_x)
         self.x_prior = np.copy(self.x)
-        self.P_prior = np.copy(self.P)
-        self.Q = eye(dim_x)
-        self.R = eye(dim_z)
+        self.P_prior = np.copy(self.Px)
+        self.uv = zeros(dim_x)
+        self.Pv = eye(dim_x)
+        self.un = zeros(dim_z)
+        self.Pn = eye(dim_z)
         self._dim_x = dim_x
         self._dim_z = dim_z
         self.points_fn = points
@@ -336,18 +344,18 @@ class UnscentedKalmanFilter(object):
         self.K = np.zeros((dim_x, dim_z))    # Kalman gain
         self.y = np.zeros((dim_z))           # residual
         self.z = np.array([[None]*dim_z]).T  # measurement
-        self.S = np.zeros((dim_z, dim_z))    # system uncertainty
-        self.SI = np.zeros((dim_z, dim_z))   # inverse system uncertainty
+        self.Pz = np.zeros((dim_z, dim_z))    # system uncertainty
+        self.PzI = np.zeros((dim_z, dim_z))   # inverse system uncertainty
 
         self.inv = np.linalg.inv
 
-        # these will always be a copy of x,P after predict() is called
+        # these will always be a copy of x,Px after predict() is called
         self.x_prior = self.x.copy()
-        self.P_prior = self.P.copy()
+        self.P_prior = self.Px.copy()
 
-        # these will always be a copy of x,P after update() is called
+        # these will always be a copy of x,Px after update() is called
         self.x_post = self.x.copy()
-        self.P_post = self.P.copy()
+        self.P_post = self.Px.copy()
 
     def predict(self, dt=None, UT=None, fx=None, **fx_args):
         r"""
@@ -388,12 +396,12 @@ class UnscentedKalmanFilter(object):
         self.compute_process_sigmas(dt, fx, **fx_args)
 
         #and pass sigmas through the unscented transform to compute prior
-        self.x, self.P = UT(self.sigmas_f, self.Wm, self.Wc, self.Q,
+        self.x, self.Px = UT(self.sigmas_f, self.Wm, self.Wc, self.Pv,
                             self.x_mean, self.residual_x)
 
         # save prior
         self.x_prior = np.copy(self.x)
-        self.P_prior = np.copy(self.P)
+        self.P_prior = np.copy(self.Px)
 
     def update(self, z, R=None, UT=None, hx=None, **hx_args):
         """
@@ -423,7 +431,7 @@ class UnscentedKalmanFilter(object):
         if z is None:
             self.z = np.array([[None]*self._dim_z]).T
             self.x_post = self.x.copy()
-            self.P_post = self.P.copy()
+            self.P_post = self.Px.copy()
             return
 
         if hx is None:
@@ -433,7 +441,7 @@ class UnscentedKalmanFilter(object):
             UT = unscented_transform
 
         if R is None:
-            R = self.R
+            R = self.Pn
         elif isscalar(R):
             R = eye(self._dim_z) * R
 
@@ -447,24 +455,24 @@ class UnscentedKalmanFilter(object):
         self.sigmas_h = np.atleast_2d(sigmas_h)
 
         # mean and covariance of prediction passed through unscented transform
-        zp, self.S = UT(self.sigmas_h, self.Wm, self.Wc, R, self.z_mean, self.residual_z)
-        self.SI = self.inv(self.S)
+        zp, self.Pz = UT(self.sigmas_h, self.Wm, self.Wc, R, self.z_mean, self.residual_z)
+        self.PzI = self.inv(self.Pz)
 
         # compute cross variance of the state and the measurements
         Pxz = self.cross_variance(self.x, zp, self.sigmas_f, self.sigmas_h)
 
 
-        self.K = dot(Pxz, self.SI)        # Kalman gain
+        self.K = dot(Pxz, self.PzI)        # Kalman gain
         self.y = self.residual_z(z, zp)   # residual
 
         # update Gaussian state estimate (x, P)
         self.x = self.x + dot(self.K, self.y)
-        self.P = self.P - dot(self.K, dot(self.S, self.K.T))
+        self.Px = self.Px - dot(self.K, dot(self.Pz, self.K.T))
 
         # save measurement and posterior state
         self.z = deepcopy(z)
         self.x_post = self.x.copy()
-        self.P_post = self.P.copy()
+        self.P_post = self.Px.copy()
 
         # set to None to force recompute
         self._log_likelihood = None
@@ -497,10 +505,18 @@ class UnscentedKalmanFilter(object):
             fx = self.fx
 
         # calculate sigma points for given mean and covariance
-        sigmas = self.points_fn.sigma_points(self.x, self.P)
+        argumentedX = np.concatenate((self.x, self.uv, self.un),axis=0)
+        nx, nx = self.Px.shape
+        nv, nv = self.Pv.shape
+        LeftTopP = np.block([[self.Px, np.zeros((nx, nv))],[np.zeros((nv,nx)), self.Pv]])
+        nlt, nlt = LeftTopP.shape
+        nn, nn = self.Pn.shape
+        argumentedP = np.block([[LeftTopP, np.zeros((nlt, nn))],[np.zeros((nn,nlt)), self.Pn]])
+        sigmas = self.points_fn.sigma_points(argumentedX, argumentedP)
 
         for i, s in enumerate(sigmas):
-            self.sigmas_f[i] = fx(s, dt, **fx_args)
+            self.sigmas_f[i][:nx] = fx(s, dt, **fx_args)[:nx]
+
 
     def batch_filter(self, zs, Rs=None, dts=None, UT=None, saver=None):
         """
@@ -586,7 +602,7 @@ class UnscentedKalmanFilter(object):
 
         z_n = np.size(zs, 0)
         if Rs is None:
-            Rs = [self.R] * z_n
+            Rs = [self.Pn] * z_n
 
         if dts is None:
             dts = [self._dt] * z_n
@@ -604,7 +620,7 @@ class UnscentedKalmanFilter(object):
             self.predict(dt=dt, UT=UT)
             self.update(z, r, UT=UT)
             means[i, :] = self.x
-            covariances[i, :, :] = self.P
+            covariances[i, :, :] = self.Px
 
             if saver is not None:
                 saver.save()
@@ -678,7 +694,7 @@ class UnscentedKalmanFilter(object):
             dts = [dts] * n
 
         if Qs is None:
-            Qs = [self.Q] * n
+            Qs = [self.Pv] * n
 
         if UT is None:
             UT = unscented_transform
@@ -698,7 +714,7 @@ class UnscentedKalmanFilter(object):
                 sigmas_f[i] = self.fx(sigmas[i], dts[k])
 
             xb, Pb = UT(
-                sigmas_f, self.Wm, self.Wc, self.Q,
+                sigmas_f, self.Wm, self.Wc, self.Pv,
                 self.x_mean, self.residual_x)
 
             # compute cross variance
@@ -724,7 +740,7 @@ class UnscentedKalmanFilter(object):
         log-likelihood of the last measurement.
         """
         if self._log_likelihood is None:
-            self._log_likelihood = logpdf(x=self.y, cov=self.S)
+            self._log_likelihood = logpdf(x=self.y, cov=self.Pz)
         return self._log_likelihood
 
     @property
@@ -760,12 +776,12 @@ class UnscentedKalmanFilter(object):
         return '\n'.join([
             'UnscentedKalmanFilter object',
             pretty_str('x', self.x),
-            pretty_str('P', self.P),
+            pretty_str('Px', self.Px),
             pretty_str('x_prior', self.x_prior),
             pretty_str('P_prior', self.P_prior),
-            pretty_str('Q', self.Q),
-            pretty_str('R', self.R),
-            pretty_str('S', self.S),
+            pretty_str('Pv', self.Pv),
+            pretty_str('Pn', self.Pn),
+            pretty_str('Pz', self.Pz),
             pretty_str('K', self.K),
             pretty_str('y', self.y),
             pretty_str('log-likelihood', self.log_likelihood),
